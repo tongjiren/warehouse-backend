@@ -13,6 +13,14 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const DB_NAME = "trackingdb";
 const PORT = process.env.PORT || 3000;
+const twilio = require("twilio");
+
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+
 
 let db;
 let users;
@@ -203,6 +211,37 @@ app.patch("/api/containers/:wh/clients/:receipt/pick", async (req, res) => {
     res.status(500).send("Server error");
   }
 });
+
+// SEND OTP SMS
+app.post("/api/auth/send-otp", async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).send("Phone required");
+
+    // générer code 6 chiffres
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // enregistrer dans MongoDB
+    await db.collection("otp_codes").insertOne({
+      phone,
+      code,
+      createdAt: new Date()
+    });
+
+    // envoyer SMS
+    await twilioClient.messages.create({
+      body: `Votre code de verification SobiExpress: ${code}`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: `+235${phone}`
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.log(e);
+    res.status(500).send("SMS error");
+  }
+});
+
 
 // ---------- START SERVER AFTER DB CONNECT ----------
 async function main() {
