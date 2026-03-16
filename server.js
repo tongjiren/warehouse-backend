@@ -242,6 +242,25 @@ app.post("/api/auth/send-otp", async (req, res) => {
   }
 });
 
+app.post("/api/auth/verify-otp", async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).send("Phone and code required");
+
+    const otp = await db.collection("otp_codes").findOne(
+      { phone, code },
+      { sort: { createdAt: -1 } }
+    );
+
+    if (!otp) return res.status(400).send("Invalid code");
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.log(e);
+    res.status(500).send("OTP verify error");
+  }
+});
+
 
 // ---------- START SERVER AFTER DB CONNECT ----------
 async function main() {
