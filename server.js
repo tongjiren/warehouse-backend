@@ -229,11 +229,11 @@ app.post("/api/auth/send-otp", async (req, res) => {
     });
 
     // envoyer SMS
-    await twilioClient.messages.create({
-      body: `Votre code de verification SobiExpress: ${code}`,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: `+235${phone}`
-    });
+client.messages.create({
+  body: `Votre code OTP est ${code}`,
+  from: "whatsapp:+14155238886",
+  to: `whatsapp:${phone}`,
+});
 
     res.json({ ok: true });
   } catch (e) {
