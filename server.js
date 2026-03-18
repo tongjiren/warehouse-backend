@@ -229,10 +229,10 @@ app.post("/api/auth/send-otp", async (req, res) => {
     });
 
     // envoyer SMS
-client.messages.create({
+await client.messages.create({
   body: `Votre code OTP est ${code}`,
   from: "whatsapp:+14155238886",
-  to: `whatsapp:${phone}`,
+  to: `whatsapp:+235${phone}`,
 });
 
     res.json({ ok: true });
