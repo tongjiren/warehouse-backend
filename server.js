@@ -229,7 +229,7 @@ app.post("/api/auth/send-otp", async (req, res) => {
     });
 
     // envoyer SMS
-await client.messages.create({
+await twilioClient.messages.create({
   body: `Votre code OTP est ${code}`,
   from: "whatsapp:+14155238886",
   to: `whatsapp:+235${phone}`,
