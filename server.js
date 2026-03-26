@@ -4,7 +4,7 @@ const cors = require("cors");
 const { MongoClient } = require("mongodb");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const axios = require("axios");
+const nodemailer = require("nodemailer");
 
 const app = express();
 app.use(cors());
@@ -18,8 +18,16 @@ const PORT = process.env.PORT || 3000;
 let db;
 let users;
 
-// ---------- HELPERS ----------
+// ---------- EMAIL ----------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
 
+// ---------- HELPERS ----------
 function normalizeTdPhone(phone) {
   const p = String(phone || "").trim().replace(/\s+/g, "");
   if (p.startsWith("+235")) return p;
@@ -38,36 +46,14 @@ function buildReceiptMatch(wh, receiptStr) {
   };
 }
 
-async function sendOtpWithBeem(phone, code) {
-  const cleanPhone = normalizeTdPhone(phone);
-
-  await axios.post(
-    "https://apisms.beem.africa/v1/send",
-    {
-      source_addr: "SOBIEXPRESS",
-      schedule_time: "",
-      encoding: 0,
-      message: `Votre code OTP est ${code}`,
-      recipients: [
-        {
-          recipient_id: 1,
-          dest_addr: cleanPhone.replace("+", ""),
-        },
-      ],
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization:
-          "Basic " +
-          Buffer.from(
-            `${process.env.BEEM_API_KEY}:${process.env.BEEM_SECRET_KEY}`
-          ).toString("base64"),
-      },
-    }
-  );
-
-  return cleanPhone;
+async function sendOtpByEmail(email, code) {
+  await transporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: "Code de vérification SobiExpress",
+    text: `Votre code OTP est : ${code}`,
+    html: `<p>Votre code OTP est : <b>${code}</b></p>`,
+  });
 }
 
 // ---------- ROUTES ----------
@@ -78,25 +64,27 @@ app.get("/health", (_, res) => res.send("OK"));
 // REGISTER (CLIENT)
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, phone, password } = req.body;
-    if (!fullName || !phone || !password) {
+    const { fullName, phone, email, password } = req.body;
+
+    if (!fullName || !password || (!phone && !email)) {
       return res.status(400).send("Missing fields");
     }
 
-    const cleanPhone = normalizeTdPhone(phone);
-    const hash = await bcrypt.hash(password, 10);
-
-    await users.insertOne({
+    const doc = {
       fullName,
-      phone: cleanPhone,
-      passwordHash: hash,
+      passwordHash: await bcrypt.hash(password, 10),
       role: "CLIENT",
       createdAt: new Date(),
-    });
+    };
+
+    if (phone) doc.phone = normalizeTdPhone(phone);
+    if (email) doc.email = String(email).trim().toLowerCase();
+
+    await users.insertOne(doc);
 
     res.status(201).json({ message: "User created" });
   } catch (e) {
-    if (e?.code === 11000) return res.status(409).send("Phone already registered");
+    if (e?.code === 11000) return res.status(409).send("Phone or email already registered");
     console.log(e);
     res.status(500).send("Server error");
   }
@@ -109,7 +97,6 @@ app.post("/api/admin/set-password", async (req, res) => {
     if (!username || !password) return res.status(400).send("Missing fields");
 
     const hash = await bcrypt.hash(password, 10);
-
     await users.updateOne({ username }, { $set: { passwordHash: hash } });
 
     res.json({ message: "Password set" });
@@ -119,18 +106,27 @@ app.post("/api/admin/set-password", async (req, res) => {
   }
 });
 
-// LOGIN (phone OR username)
+// LOGIN (phone OR username OR email)
 app.post("/api/auth/login", async (req, res) => {
   try {
-    const { phone, username, password } = req.body;
-    if ((!phone && !username) || !password) {
+    const { phone, username, email, password } = req.body;
+
+    if ((!phone && !username && !email) || !password) {
       return res.status(400).send("Missing fields");
     }
 
-    const cleanPhone = phone ? normalizeTdPhone(phone) : null;
-    const user = await users.findOne(username ? { username } : { phone: cleanPhone });
+    let query = null;
 
-    if (!user) return res.status(404).send("Phone not registered");
+    if (username) {
+      query = { username };
+    } else if (email) {
+      query = { email: String(email).trim().toLowerCase() };
+    } else {
+      query = { phone: normalizeTdPhone(phone) };
+    }
+
+    const user = await users.findOne(query);
+    if (!user) return res.status(404).send("User not found");
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).send("Bad credentials");
@@ -148,43 +144,43 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// SEND OTP
+// SEND OTP BY EMAIL
 app.post("/api/auth/send-otp", async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).send("Phone required");
+    const { email } = req.body;
+    if (!email) return res.status(400).send("Email required");
 
-    const cleanPhone = normalizeTdPhone(phone);
+    const cleanEmail = String(email).trim().toLowerCase();
     const code = Math.floor(100000 + Math.random() * 900000).toString();
 
     await db.collection("otp_codes").insertOne({
-      phone: cleanPhone,
+      email: cleanEmail,
       code,
       createdAt: new Date(),
     });
 
-    await sendOtpWithBeem(cleanPhone, code);
+    await sendOtpByEmail(cleanEmail, code);
 
     res.json({ ok: true });
   } catch (e) {
-    console.log(e?.response?.data || e);
-    res.status(500).send("SMS error");
+    console.log(e);
+    res.status(500).send("Email error");
   }
 });
 
 // VERIFY OTP
 app.post("/api/auth/verify-otp", async (req, res) => {
   try {
-    const phone = normalizeTdPhone(req.body.phone || "");
+    const email = String(req.body.email || "").trim().toLowerCase();
     const code = String(req.body.code || "").trim();
 
-    if (!phone || !code) {
-      return res.status(400).send("Phone and code required");
+    if (!email || !code) {
+      return res.status(400).send("Email and code required");
     }
 
     const rows = await db
       .collection("otp_codes")
-      .find({ phone, code })
+      .find({ email, code })
       .sort({ createdAt: -1 })
       .limit(1)
       .toArray();
