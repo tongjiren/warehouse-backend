@@ -4,6 +4,7 @@ const cors = require("cors");
 const { MongoClient } = require("mongodb");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const axios = require("axios");
 
 const app = express();
 app.use(cors());
@@ -13,17 +14,61 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const DB_NAME = "trackingdb";
 const PORT = process.env.PORT || 3000;
-const twilio = require("twilio");
-
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-
-
 
 let db;
 let users;
+
+// ---------- HELPERS ----------
+
+function normalizeTdPhone(phone) {
+  const p = String(phone || "").trim().replace(/\s+/g, "");
+  if (p.startsWith("+235")) return p;
+  if (p.startsWith("235")) return `+${p}`;
+  return `+235${p}`;
+}
+
+function buildReceiptMatch(wh, receiptStr) {
+  const receiptNum = Number.isFinite(Number(receiptStr)) ? Number(receiptStr) : null;
+  return {
+    wh,
+    $or: [
+      { "clients.receipt": receiptStr },
+      ...(receiptNum !== null ? [{ "clients.receipt": receiptNum }] : []),
+    ],
+  };
+}
+
+async function sendOtpWithBeem(phone, code) {
+  const cleanPhone = normalizeTdPhone(phone);
+
+  await axios.post(
+    "https://apisms.beem.africa/v1/send",
+    {
+      source_addr: "SOBIEXPRESS",
+      schedule_time: "",
+      encoding: 0,
+      message: `Votre code OTP est ${code}`,
+      recipients: [
+        {
+          recipient_id: 1,
+          dest_addr: cleanPhone.replace("+", ""),
+        },
+      ],
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization:
+          "Basic " +
+          Buffer.from(
+            `${process.env.BEEM_API_KEY}:${process.env.BEEM_SECRET_KEY}`
+          ).toString("base64"),
+      },
+    }
+  );
+
+  return cleanPhone;
+}
 
 // ---------- ROUTES ----------
 
@@ -34,13 +79,16 @@ app.get("/health", (_, res) => res.send("OK"));
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { fullName, phone, password } = req.body;
-    if (!fullName || !phone || !password) return res.status(400).send("Missing fields");
+    if (!fullName || !phone || !password) {
+      return res.status(400).send("Missing fields");
+    }
 
+    const cleanPhone = normalizeTdPhone(phone);
     const hash = await bcrypt.hash(password, 10);
 
     await users.insertOne({
       fullName,
-      phone,
+      phone: cleanPhone,
       passwordHash: hash,
       role: "CLIENT",
       createdAt: new Date(),
@@ -75,19 +123,80 @@ app.post("/api/admin/set-password", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { phone, username, password } = req.body;
-    if ((!phone && !username) || !password) return res.status(400).send("Missing fields");
+    if ((!phone && !username) || !password) {
+      return res.status(400).send("Missing fields");
+    }
 
-    const user = await users.findOne(username ? { username } : { phone });
+    const cleanPhone = phone ? normalizeTdPhone(phone) : null;
+    const user = await users.findOne(username ? { username } : { phone: cleanPhone });
+
     if (!user) return res.status(404).send("Phone not registered");
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).send("Bad credentials");
 
-    const token = jwt.sign({ uid: user._id.toString(), role: user.role }, JWT_SECRET, { expiresIn: "30d" });
+    const token = jwt.sign(
+      { uid: user._id.toString(), role: user.role },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
     res.json({ token, role: user.role });
   } catch (e) {
     console.log(e);
     res.status(500).send("Server error");
+  }
+});
+
+// SEND OTP
+app.post("/api/auth/send-otp", async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).send("Phone required");
+
+    const cleanPhone = normalizeTdPhone(phone);
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    await db.collection("otp_codes").insertOne({
+      phone: cleanPhone,
+      code,
+      createdAt: new Date(),
+    });
+
+    await sendOtpWithBeem(cleanPhone, code);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.log(e?.response?.data || e);
+    res.status(500).send("SMS error");
+  }
+});
+
+// VERIFY OTP
+app.post("/api/auth/verify-otp", async (req, res) => {
+  try {
+    const phone = normalizeTdPhone(req.body.phone || "");
+    const code = String(req.body.code || "").trim();
+
+    if (!phone || !code) {
+      return res.status(400).send("Phone and code required");
+    }
+
+    const rows = await db
+      .collection("otp_codes")
+      .find({ phone, code })
+      .sort({ createdAt: -1 })
+      .limit(1)
+      .toArray();
+
+    if (!rows || rows.length === 0) {
+      return res.status(400).send("Invalid code");
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.log(e);
+    res.status(500).send("OTP verify error");
   }
 });
 
@@ -115,7 +224,6 @@ app.get("/api/containers/:wh/summary", async (req, res) => {
     const paidCount = (doc.clients || []).filter((c) => c.paid).length;
     const pickedCount = (doc.clients || []).filter((c) => c.picked).length;
     const notPickedCount = totalClients - pickedCount;
-
     const paidNotPicked = (doc.clients || []).filter((c) => c.paid && !c.picked).length;
     const pickedNotPaid = (doc.clients || []).filter((c) => c.picked && !c.paid).length;
 
@@ -138,19 +246,7 @@ app.get("/api/containers/:wh/summary", async (req, res) => {
   }
 });
 
-// helper: receipt match string OR number
-function buildReceiptMatch(wh, receiptStr) {
-  const receiptNum = Number.isFinite(Number(receiptStr)) ? Number(receiptStr) : null;
-  return {
-    wh,
-    $or: [
-      { "clients.receipt": receiptStr },
-      ...(receiptNum !== null ? [{ "clients.receipt": receiptNum }] : []),
-    ],
-  };
-}
-
-// PAY (works even if already picked)
+// PAY
 app.patch("/api/containers/:wh/clients/:receipt/pay", async (req, res) => {
   try {
     const wh = String(req.params.wh || "").toUpperCase();
@@ -175,7 +271,7 @@ app.patch("/api/containers/:wh/clients/:receipt/pay", async (req, res) => {
   }
 });
 
-// PICK (requires reason if not paid)
+// PICK
 app.patch("/api/containers/:wh/clients/:receipt/pick", async (req, res) => {
   try {
     const wh = String(req.params.wh || "").toUpperCase();
@@ -184,9 +280,13 @@ app.patch("/api/containers/:wh/clients/:receipt/pick", async (req, res) => {
 
     const match = buildReceiptMatch(wh, receiptStr);
 
-    // read targeted client to check paid
-    const doc = await db.collection("containers").findOne(match, { projection: { "clients.$": 1 } });
-    if (!doc || !doc.clients || !doc.clients[0]) return res.status(404).send("Client not found");
+    const doc = await db.collection("containers").findOne(match, {
+      projection: { "clients.$": 1 },
+    });
+
+    if (!doc || !doc.clients || !doc.clients[0]) {
+      return res.status(404).send("Client not found");
+    }
 
     const paid = !!doc.clients[0].paid;
 
@@ -203,6 +303,7 @@ app.patch("/api/containers/:wh/clients/:receipt/pick", async (req, res) => {
     if (!paid) update["clients.$.reasonNoPayment"] = String(reason).trim();
 
     const result = await db.collection("containers").updateOne(match, { $set: update });
+
     if (result.matchedCount === 0) return res.status(404).send("Client not found");
 
     res.json({ ok: true, paid });
@@ -212,65 +313,43 @@ app.patch("/api/containers/:wh/clients/:receipt/pick", async (req, res) => {
   }
 });
 
-// SEND OTP SMS
-app.post("/api/auth/send-otp", async (req, res) => {
+// PHOTOS
+app.patch("/api/containers/:wh/clients/:receipt/photos", async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).send("Phone required");
+    const wh = String(req.params.wh || "").toUpperCase();
+    const receiptStr = String(req.params.receipt || "").trim();
+    const { receptionUrl, receiptUrl, pickupUrl } = req.body;
 
-    // générer code 6 chiffres
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const receiptNum = Number.isFinite(Number(receiptStr)) ? Number(receiptStr) : null;
 
-    // enregistrer dans MongoDB
-    await db.collection("otp_codes").insertOne({
-      phone,
-      code,
-      createdAt: new Date()
-    });
+    const match = {
+      wh,
+      $or: [
+        { "clients.receipt": receiptStr },
+        ...(receiptNum !== null ? [{ "clients.receipt": receiptNum }] : []),
+      ],
+    };
 
-    // envoyer SMS
-await twilioClient.messages.create({
-  body: `Votre code OTP est ${code}`,
-  from: "whatsapp:+14155238886",
-  to: `whatsapp:+235${phone}`,
-});
+    const update = {};
 
-    res.json({ ok: true });
-  } catch (e) {
-    console.log(e);
-    res.status(500).send("SMS error");
-  }
-});
+    if (receptionUrl !== undefined) update["clients.$.receptionUrl"] = receptionUrl;
+    if (receiptUrl !== undefined) update["clients.$.receiptUrl"] = receiptUrl;
+    if (pickupUrl !== undefined) update["clients.$.pickupUrl"] = pickupUrl;
 
-app.post("/api/auth/verify-otp", async (req, res) => {
-  try {
-    const phone = String(req.body.phone || "").trim();
-    const code = String(req.body.code || "").trim();
+    const result = await db.collection("containers").updateOne(match, { $set: update });
 
-    if (!phone || !code) {
-      return res.status(400).send("Phone and code required");
-    }
-
-    const rows = await db
-      .collection("otp_codes")
-      .find({ phone, code })
-      .sort({ createdAt: -1 })
-      .limit(1)
-      .toArray();
-
-    if (!rows || rows.length === 0) {
-      return res.status(400).send("Invalid code");
+    if (result.matchedCount === 0) {
+      return res.status(404).send("Client not found");
     }
 
     res.json({ ok: true });
   } catch (e) {
     console.log(e);
-    res.status(500).send("OTP verify error");
+    res.status(500).send("Server error");
   }
 });
 
-
-// ---------- START SERVER AFTER DB CONNECT ----------
+// ---------- START ----------
 async function main() {
   if (!MONGODB_URI) {
     console.log("❌ Missing MONGODB_URI in .env");
@@ -291,43 +370,4 @@ async function main() {
 main().catch((e) => {
   console.log("❌ Mongo connect error:", e);
   process.exit(1);
-});
-
-app.patch("/api/containers/:wh/clients/:receipt/photos", async (req, res) => {
-  try {
-    const wh = String(req.params.wh || "").toUpperCase();
-    const receiptStr = String(req.params.receipt || "").trim();
-
-    const { receptionUrl, receiptUrl, pickupUrl } = req.body;
-
-    const receiptNum = Number.isFinite(Number(receiptStr)) ? Number(receiptStr) : null;
-
-    const match = {
-      wh,
-      $or: [
-        { "clients.receipt": receiptStr },
-        ...(receiptNum !== null ? [{ "clients.receipt": receiptNum }] : []),
-      ],
-    };
-
-    const update = {};
-
-    if (receptionUrl !== undefined) update["clients.$.receptionUrl"] = receptionUrl;
-    if (receiptUrl !== undefined) update["clients.$.receiptUrl"] = receiptUrl;
-    if (pickupUrl !== undefined) update["clients.$.pickupUrl"] = pickupUrl;
-
-    const result = await db.collection("containers").updateOne(
-      match,
-      { $set: update }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send("Client not found");
-    }
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.log(e);
-    res.status(500).send("Server error");
-  }
 });
