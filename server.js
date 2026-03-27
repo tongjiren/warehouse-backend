@@ -85,7 +85,7 @@ app.post("/api/auth/register", async (req, res) => {
     res.status(201).json({ message: "User created" });
   } catch (e) {
     if (e?.code === 11000) return res.status(409).send("Phone or email already registered");
-    console.log(e);
+   console.log("EMAIL ERROR:", e?.message, e?.response);
     res.status(500).send("Server error");
   }
 });
